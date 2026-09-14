@@ -35,7 +35,7 @@ client-go `tools/leaderelection`，作为独立库供各项目复用。
 | tryAcquireOrRenew 单函数 | 单 Lua 脚本四分支 |
 | leaseTransitions | `transitions` 字段 |
 | OnStartedLeading/OnStoppedLeading/OnNewLeader | 相同三回调 |
-| ReleaseOnCancel | 相同选项（renewTime 置 0） |
+| ReleaseOnCancel | 相同选项（K8s 置 LeaseDurationSeconds=1，本库置 renewTime=0，效果同构：等待者下一轮即可抢占） |
 
 关键等价关系：K8s 的"GET Lease → 本地判定 → 带 resourceVersion 的 UPDATE →
 409 冲突则重试"这套乐观并发，在 Redis 中退化为**一次 Lua 原子操作**——
@@ -69,14 +69,20 @@ KEYS[1]=key  ARGV[1]=identity  ARGV[2]=leaseDurationMs
 now = redis.call('TIME') 转 ms                 ← 统一时间基准
 
 ① 无主     → HSET holder=identity version=1 renewTime=now transitions=0
-             PEXPIRE 2×lease     → return {ACQUIRED, 1, identity, 0}
+             PEXPIRE 2×lease     → return {ACQUIRED(2), 1, identity, 0, now, now}
 ② 自己持有 → HSET version+1 renewTime=now
-             PEXPIRE 2×lease     → return {RENEWED, v, identity, t}
+             PEXPIRE 2×lease     → return {RENEWED(3), v, identity, t, at, now}
 ③ 他人过期 → (now - renewTime > lease)
              HSET holder=identity version+1 renewTime=now acquireTime=now
-             HINCRBY transitions → return {ACQUIRED, v, identity, t+1}
-④ 他人活跃 →                          return {HELD_BY_OTHER, v, holder, t}
+             HINCRBY transitions → return {ACQUIRED(2), v, identity, t+1, now, now}
+④ 他人活跃 →                          return {HELD_BY_OTHER(1), v, holder, t, at, rt}
 ```
+
+返回 6 元组含 acquireTime/renewTime（Redis 时钟 ms），调用方每轮即可
+观察完整租约快照——对齐 K8s（elector 通过 Lock.Get 每轮可见完整
+LeaderElectionRecord）。事件编号与 Go 侧 `Event` 常量一致（1=HeldByOther,
+2=Acquired, 3=Renewed），0 保留给错误路径（`EventInvalid`），不由脚本返回；
+错误路径显式返回 `EventInvalid`，不再与谦让分支混淆。
 
 release 脚本：
 
@@ -98,8 +104,17 @@ lead:    OnStartedLeading(ctx) 运行业务（异步）
            成功             → 刷新 lastRenew
            存储错误          → RenewDeadline 宽限内重试，超时自贬（防抖动误判）
            HELD_BY_OTHER    → 立即自贬（存储健康、判定可信，压缩双跑窗口）
-         退出时: isLeader=false → (可选)Release → OnStoppedLeading → 回 acquire
+         退出时: isLeader=false → cancel(业务ctx) → (可选)Release(超时=RenewDeadline)
+                 → OnStoppedLeading → 回 acquire
+Run 退出时若从未 lead → 补触发一次 OnStoppedLeading
+         （K8s 语义："always called when the LeaderElector exits,
+          even if it did not start leading"）
 ```
+
+cancel 前置于 Release 的理由（与 K8s 的刻意微差异）：Release 是网络调用
+（预算 RenewDeadline，对齐 K8s release 的超时），若 cancel 压在其后会推迟
+业务停止、拉长双跑窗口；前置 cancel 保住"OnStoppedLeading 触发时业务 ctx
+已取消"的 K8s 不变量，failover 仅慢微秒级（cancel 不等待业务退出）。
 
 不变式与推论：
 
@@ -128,14 +143,14 @@ T1+15~17s B 抢占接管          ← failover 最坏 ≈ Lease + Retry
 ```
 低层 LeaseLock（对标 resourcelock.Interface）
   NewLeaseLock(client Client, key, identity)
-  TryAcquireOrRenew(ctx, lease) (event, LeaseRecord, error)
+  TryAcquireOrRenew(ctx, lease) (Event, LeaseRecord, error) // 出错返回 EventInvalid
   Release(ctx) error            // ErrNotHoldingLease 哨兵
   Get(ctx) (LeaseRecord, error) // ErrNoLease 哨兵
   Client = redis.Scripter + HGetAll（*redis.Client/Cluster/Universal 均满足）
 
 高层 Elector（对标 LeaderElector）
-  NewElector(lock Lock, opts...)          // Config.validate: Retry < Renew < Lease
-  Run(ctx)                                // 阻塞；降级等待重选
+  NewElector(lock Lock, opts...)          // Config.validate: Retry×Jitter < Renew < Lease
+  Run(ctx)                                // 阻塞；降级等待重选；并发防护
   IsLeader() / LeaderID()
   With{LeaseDuration,RenewDeadline,RetryPeriod,JitterFactor,
        ReleaseOnCancel,Logger,OnStartedLeading,OnStoppedLeading,OnNewLeader}
@@ -149,6 +164,7 @@ T1+15~17s B 抢占接管          ← failover 最坏 ≈ Lease + Retry
 | 场景 | 处理 |
 |---|---|
 | 实例时钟漂移 | 无影响，判定基于 Redis 时钟 |
+| 实例本地时钟回拨 | RenewDeadline 宽限判定基于本地时钟（K8s 同款，其 PollUntilContextTimeout 亦为本地定时器），大幅回拨推迟自贬；租约有效性不受影响 |
 | Redis 抖动 | RenewDeadline 宽限，防误自贬 |
 | Redis 完全不可用 | 全员自贬停跑；恢复重选（宁可停跑不可双跑） |
 | 假死复活 | renew 得 HeldByOther 立即自贬；Release 校验 holder 不误伤新主 |
@@ -157,10 +173,12 @@ T1+15~17s B 抢占接管          ← failover 最坏 ≈ Lease + Retry
 
 ## 9. 测试策略
 
-miniredis（支持 Lua + TIME 可控）：四分支、Release 语义、TTL 兜底、
-生命周期、双实例 failover、Redis 故障自贬、抢占后立即自贬 + 重选、
-参数校验、jitter 边界。真时钟 + 短参数驱动状态机，SetTime 定钟隔离时间。
-CI（GitHub Actions，ubuntu 自带 gcc）跑 `-race`，覆盖率 91%+。
+miniredis（支持 Lua + TIME 可控）：四分支（含时间字段）、Release 语义、
+TTL 兜底、生命周期、双实例 failover、Redis 故障自贬、抢占后立即自贬 +
+重选、错误路径 EventInvalid、回调顺序（cancel 先于 OnStoppedLeading）、
+Run 并发防护与重启、从未 lead 的 OnStoppedLeading 触发、参数校验
+（含 K8s jitter 规则）、jitter 边界。真时钟 + 短参数驱动状态机，
+SetTime 定钟隔离时间。CI（GitHub Actions，ubuntu 自带 gcc）跑 `-race`。
 
 ## 10. 已知限制
 

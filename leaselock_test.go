@@ -44,11 +44,15 @@ func TestLeaseLock_FourBranches(t *testing.T) {
 	if ev != EventAcquired || rec.Holder != "A" || rec.Version != 1 || rec.Transitions != 0 {
 		t.Fatalf("A acquire: ev=%d rec=%+v", ev, rec)
 	}
+	if rec.AcquireTime != start.UnixMilli() || rec.RenewTime != start.UnixMilli() {
+		t.Fatalf("A acquire times: acquire=%d renew=%d, want %d",
+			rec.AcquireTime, rec.RenewTime, start.UnixMilli())
+	}
 	if ttl := mr.TTL(testKey); ttl < lease || ttl > 2*lease {
 		t.Fatalf("ttl should be in [lease, 2*lease], got %v", ttl)
 	}
 
-	// ② A 续约：version 递增
+	// ② A 续约：version 递增，renewTime 刷新，acquireTime 保持
 	mr.SetTime(start.Add(1 * time.Second))
 	ev, rec, err = lockA.TryAcquireOrRenew(ctx, lease)
 	if err != nil {
@@ -57,14 +61,21 @@ func TestLeaseLock_FourBranches(t *testing.T) {
 	if ev != EventRenewed || rec.Holder != "A" || rec.Version != 2 {
 		t.Fatalf("A renew: ev=%d rec=%+v", ev, rec)
 	}
+	if rec.AcquireTime != start.UnixMilli() || rec.RenewTime != start.Add(time.Second).UnixMilli() {
+		t.Fatalf("A renew times: acquire=%d renew=%d, want %d/%d",
+			rec.AcquireTime, rec.RenewTime, start.UnixMilli(), start.Add(time.Second).UnixMilli())
+	}
 
-	// ④ B 谦让：A 未过期，B 不得抢占
+	// ④ B 谦让：A 未过期，B 不得抢占；时间字段透传当前持有者的值
 	ev, rec, err = lockB.TryAcquireOrRenew(ctx, lease)
 	if err != nil {
 		t.Fatalf("B hold: %v", err)
 	}
 	if ev != EventHeldByOther || rec.Holder != "A" || rec.Version != 2 {
 		t.Fatalf("B hold: ev=%d rec=%+v", ev, rec)
+	}
+	if rec.AcquireTime != start.UnixMilli() || rec.RenewTime != start.Add(time.Second).UnixMilli() {
+		t.Fatalf("B hold times: acquire=%d renew=%d", rec.AcquireTime, rec.RenewTime)
 	}
 
 	// ③ B 抢占：距 A 最后续约（start+1s）超过 lease
@@ -76,6 +87,11 @@ func TestLeaseLock_FourBranches(t *testing.T) {
 	if ev != EventAcquired || rec.Holder != "B" || rec.Version != 3 || rec.Transitions != 1 {
 		t.Fatalf("B preempt: ev=%d rec=%+v", ev, rec)
 	}
+	want := start.Add(12 * time.Second).UnixMilli()
+	if rec.AcquireTime != want || rec.RenewTime != want {
+		t.Fatalf("B preempt times: acquire=%d renew=%d, want %d",
+			rec.AcquireTime, rec.RenewTime, want)
+	}
 
 	// A 复活后续约 → 谦让（B 活跃）
 	ev, rec, err = lockA.TryAcquireOrRenew(ctx, lease)
@@ -84,6 +100,25 @@ func TestLeaseLock_FourBranches(t *testing.T) {
 	}
 	if ev != EventHeldByOther || rec.Holder != "B" {
 		t.Fatalf("A after preempt: ev=%d rec=%+v", ev, rec)
+	}
+}
+
+// TestLeaseLock_ScriptError 验证存储错误路径：err 非 nil 时事件码为
+// EventInvalid（不与 EventHeldByOther 混淆），快照为零值。
+func TestLeaseLock_ScriptError(t *testing.T) {
+	rdb, mr := newTestRedis(t)
+	lock := NewLeaseLock(rdb, testKey, "A")
+
+	mr.Close()
+	ev, rec, err := lock.TryAcquireOrRenew(context.Background(), 10*time.Second)
+	if err == nil {
+		t.Fatal("expected error after redis close")
+	}
+	if ev != EventInvalid {
+		t.Fatalf("event on error: got %d, want EventInvalid", ev)
+	}
+	if rec != (LeaseRecord{}) {
+		t.Fatalf("record on error should be zero value, got %+v", rec)
 	}
 }
 

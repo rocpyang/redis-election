@@ -28,7 +28,8 @@ type Config struct {
 	Lock Lock
 
 	// LeaseDuration / RenewDeadline / RetryPeriod / JitterFactor 见常量注释。
-	// 约束：RetryPeriod < RenewDeadline < LeaseDuration。
+	// 约束：RetryPeriod×JitterFactor < RenewDeadline < LeaseDuration
+	//（与 K8s LeaderElectionConfig 校验规则对齐）。
 	LeaseDuration time.Duration
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
@@ -55,12 +56,13 @@ func WithLeaseDuration(d time.Duration) ElectorOption {
 	return func(c *Config) { c.LeaseDuration = d }
 }
 
-// WithRenewDeadline 设置续约失败自贬的宽限预算，必须小于 LeaseDuration 且大于 RetryPeriod。
+// WithRenewDeadline 设置续约失败自贬的宽限预算，
+// 约束见 Config：RetryPeriod×JitterFactor < RenewDeadline < LeaseDuration。
 func WithRenewDeadline(d time.Duration) ElectorOption {
 	return func(c *Config) { c.RenewDeadline = d }
 }
 
-// WithRetryPeriod 设置尝试间隔，必须小于 RenewDeadline。
+// WithRetryPeriod 设置尝试间隔，约束见 Config。
 func WithRetryPeriod(d time.Duration) ElectorOption {
 	return func(c *Config) { c.RetryPeriod = d }
 }
@@ -115,14 +117,17 @@ func (c *Config) validate() error {
 		return fmt.Errorf("%w: RenewDeadline must be positive, got %s", ErrInvalidConfig, c.RenewDeadline)
 	case c.RetryPeriod <= 0:
 		return fmt.Errorf("%w: RetryPeriod must be positive, got %s", ErrInvalidConfig, c.RetryPeriod)
+	case c.JitterFactor < 0:
+		return fmt.Errorf("%w: JitterFactor must not be negative, got %v", ErrInvalidConfig, c.JitterFactor)
 	case c.RenewDeadline >= c.LeaseDuration:
 		return fmt.Errorf("%w: RenewDeadline(%s) must be less than LeaseDuration(%s)",
 			ErrInvalidConfig, c.RenewDeadline, c.LeaseDuration)
 	case c.RetryPeriod >= c.RenewDeadline:
 		return fmt.Errorf("%w: RetryPeriod(%s) must be less than RenewDeadline(%s)",
 			ErrInvalidConfig, c.RetryPeriod, c.RenewDeadline)
-	case c.JitterFactor < 0:
-		return fmt.Errorf("%w: JitterFactor must not be negative, got %v", ErrInvalidConfig, c.JitterFactor)
+	case c.RenewDeadline <= time.Duration(float64(c.RetryPeriod)*c.JitterFactor):
+		return fmt.Errorf("%w: RenewDeadline(%s) must be greater than RetryPeriod(%s)*JitterFactor(%v)",
+			ErrInvalidConfig, c.RenewDeadline, c.RetryPeriod, c.JitterFactor)
 	}
 	return nil
 }

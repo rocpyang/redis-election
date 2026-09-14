@@ -9,16 +9,22 @@
 //   - version 字段单调递增，可作为下游写操作的 fencing token。
 package rediselection
 
-// TryAcquireOrRenew 的事件码，由 Lua 脚本返回。
+// Event 是 TryAcquireOrRenew 返回的事件码，由 Lua 脚本返回。
+type Event int
+
 const (
+	// EventInvalid 表示无效事件：TryAcquireOrRenew 出错时返回，
+	// 调用方应优先检查 error（K8s 的 bool 返回将错误与谦让混淆，
+	// 此处以显式无效值区分）。
+	EventInvalid Event = iota
 	// EventHeldByOther 表示租约被其他实例持有且尚未过期。
 	// 调用方应继续等待并在下一轮重试。
-	EventHeldByOther = 0
+	EventHeldByOther
 	// EventAcquired 表示调用方成功获得租约：
 	// 可能是新建租约（此前无主），也可能是抢占了他人的过期租约。
-	EventAcquired = 1
+	EventAcquired
 	// EventRenewed 表示调用方本身就是持有者，本次为续约成功。
-	EventRenewed = 2
+	EventRenewed
 )
 
 // tryAcquireOrRenewScript 对标 K8s leaderelection 的 tryAcquireOrRenew：
@@ -28,10 +34,14 @@ const (
 // ARGV[1] = 调用方 identity
 // ARGV[2] = leaseDuration（毫秒）
 //
-// 返回 {event, version, currentHolder, transitions}：
-//   - {1, v, identity, t}    新建或抢占成功，当前持有者为调用方
-//   - {2, v, identity, t}    续约成功
-//   - {0, v, holder, t}      他人持锁未过期（holder 为当前持有者）
+// 返回 {event, version, currentHolder, transitions, acquireTime, renewTime}：
+//   - {2, v, identity, t, now, now}   新建或抢占成功，当前持有者为调用方
+//   - {3, v, identity, t, at, now}    续约成功（at 为原 acquireTime）
+//   - {1, v, holder, t, at, rt}       他人持锁未过期（holder 为当前持有者）
+//
+// 事件编号与 Go 侧 Event 常量一致，0 保留给错误路径（EventInvalid），
+// 不由脚本返回。时间字段使调用方每轮即可观察完整租约快照
+// （对齐 K8s：elector 通过 Lock.Get 每轮可见完整 LeaderElectionRecord）。
 //
 // 过期判定基准 now 取自 redis.call('TIME')（Redis 服务器时钟），
 // 各实例本地时钟不参与判定，避免时钟漂移导致双主或误抢。
@@ -50,6 +60,7 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 local holder = redis.call('HGET', key, 'holder')
 local version = tonumber(redis.call('HGET', key, 'version') or '0')
+local acquireTime = tonumber(redis.call('HGET', key, 'acquireTime') or '0')
 local renewTime = tonumber(redis.call('HGET', key, 'renewTime') or '0')
 local transitions = tonumber(redis.call('HGET', key, 'transitions') or '0')
 
@@ -62,14 +73,14 @@ if not holder then
     'renewTime', now,
     'transitions', 0)
   redis.call('PEXPIRE', key, leaseMs * 2)
-  return {1, 1, identity, 0}
+  return {2, 1, identity, 0, now, now}
 
 elseif holder == identity then
   -- ② 自己持有：续约（version 递增 = fencing token）
   local v = version + 1
   redis.call('HSET', key, 'version', v, 'renewTime', now)
   redis.call('PEXPIRE', key, leaseMs * 2)
-  return {2, v, identity, transitions}
+  return {3, v, identity, transitions, acquireTime, now}
 
 elseif now - renewTime > leaseMs then
   -- ③ 他人租约已过期：抢占
@@ -81,11 +92,11 @@ elseif now - renewTime > leaseMs then
     'renewTime', now)
   redis.call('HINCRBY', key, 'transitions', 1)
   redis.call('PEXPIRE', key, leaseMs * 2)
-  return {1, v, identity, transitions + 1}
+  return {2, v, identity, transitions + 1, now, now}
 
 else
   -- ④ 他人持锁且未过期：谦让
-  return {0, version, holder, transitions}
+  return {1, version, holder, transitions, acquireTime, renewTime}
 end
 `
 

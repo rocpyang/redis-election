@@ -19,17 +19,26 @@ import (
 //	       └─ ctx 取消 → 退出
 //	  └─ 自贬后回到 acquire，降级等待重选（不退出进程）
 //
-// 与 K8s 原生实现的两点刻意差异（均为更安全的取舍，详见 README）：
+// 与 K8s 原生实现的三点刻意差异（均为更安全的取舍，详见 README）：
 //  1. 丢锁后默认降级等待重选，而非退出进程；
 //  2. 观察到租约被明确抢占时立即自贬，而非等满 RenewDeadline，
-//     将"被抢占场景"的双跑窗口压缩到接近 0。
+//     将"被抢占场景"的双跑窗口压缩到接近 0；
+//  3. 失去 leadership 时先取消业务 ctx、再让位（Release），
+//     修正 K8s 将 cancel 压在 Release 网络调用之后的缺陷。
 //
-// Elector 非并发启动多个 Run；IsLeader/LeaderID 可被任意 goroutine 查询。
+// Run 有并发防护（重复调用记日志后直接返回），Run 返回后可再次调用；
+// IsLeader/LeaderID 可被任意 goroutine 查询。
 type Elector struct {
 	cfg Config
 
 	isLeader atomic.Bool
 	leaderID atomic.Pointer[string]
+	running  atomic.Bool
+
+	// ledThisRun 记录本次 Run 是否进入过 lead，仅由 Run 所在 goroutine
+	// 读写，用于实现 K8s 语义："Run 退出必触发 OnStoppedLeading，
+	// 即使从未当选"。
+	ledThisRun bool
 }
 
 // NewElector 创建选主器并校验配置（时间参数约束见 Config 注释）。
@@ -63,7 +72,27 @@ func (e *Elector) Config() Config { return e.cfg }
 //
 // 或在独立 goroutine 中与信号处理配合，收到 SIGTERM 后 cancel ctx，
 // 并视需要开启 WithReleaseOnCancel 加速 failover。
+//
+// OnStoppedLeading 语义对标 K8s：每次失去 leadership 触发一次；若本次
+// Run 从未当选，Run 退出时也会触发一次——不要假设它只在
+// OnStartedLeading 之后调用。
+//
+// 并发调用 Run 会被防护：后续调用记录日志后直接返回，不触发任何回调。
 func (e *Elector) Run(ctx context.Context) {
+	if !e.running.CompareAndSwap(false, true) {
+		e.logf("Run: concurrent invocation detected, ignoring")
+		return
+	}
+	defer e.running.Store(false)
+	e.ledThisRun = false
+	defer func() {
+		if !e.ledThisRun {
+			e.logf("run: stopped without ever leading")
+			if e.cfg.OnStoppedLeading != nil {
+				e.cfg.OnStoppedLeading()
+			}
+		}
+	}()
 	for ctx.Err() == nil {
 		if !e.acquire(ctx) {
 			return
@@ -112,6 +141,7 @@ func (e *Elector) lead(parent context.Context) bool {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
+	e.ledThisRun = true
 	e.isLeader.Store(true)
 	e.observeLeader(e.cfg.Lock.Identity())
 	e.logf("lead: became leader, identity=%s", e.cfg.Lock.Identity())
@@ -130,36 +160,44 @@ func (e *Elector) lead(parent context.Context) bool {
 			e.logf("lead: renew error: %v", err)
 			if now.Sub(lastRenew) >= e.cfg.RenewDeadline {
 				e.logf("lead: renew deadline exceeded, stepping down")
-				e.stepDown()
+				e.stepDown(cancel)
 				return parent.Err() == nil
 			}
 		case ev == EventHeldByOther:
 			// 租约被明确抢占且新持有者活跃（存储系统健康、判定可信）：
 			// 立即自贬，不等满 RenewDeadline，压缩双跑窗口。
 			e.logf("lead: lease now held by %q, stepping down immediately", rec.Holder)
-			e.stepDown()
+			e.stepDown(cancel)
 			return parent.Err() == nil
 		default: // EventAcquired / EventRenewed：本实例仍持有租约
 			lastRenew = now
 		}
 		if !sleepJitter(ctx, e.cfg.RetryPeriod, e.cfg.JitterFactor) {
-			e.stepDown()
+			e.stepDown(cancel)
 			return false
 		}
 	}
 }
 
 // stepDown 统一处理失去 leadership 的收尾：
-// 清 leader 标记、（可选）主动让位、触发 OnStoppedLeading 回调。
-func (e *Elector) stepDown() {
+// 清 leader 标记 → 取消业务 ctx →（可选）主动让位 → 触发 OnStoppedLeading。
+//
+// 顺序对标 K8s 的不变量"OnStoppedLeading 触发时 OnStartedLeading 的
+// ctx 已被取消"；cancel 刻意前置于 Release：Release 是网络调用
+// （超时预算 RenewDeadline，对齐 K8s release 的预算），若压在 cancel
+// 之后会推迟业务停止、拉长双跑窗口。
+func (e *Elector) stepDown(cancel context.CancelFunc) {
 	e.isLeader.Store(false)
+	if cancel != nil {
+		cancel()
+	}
 	if e.cfg.ReleaseOnCancel {
 		// 尽力让位：使用独立超时，不依赖已取消的选主 ctx。
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancelRelease := context.WithTimeout(context.Background(), e.cfg.RenewDeadline)
 		if err := e.cfg.Lock.Release(ctx); err != nil && !errors.Is(err, ErrNotHoldingLease) {
 			e.logf("release: %v", err)
 		}
-		cancel()
+		cancelRelease()
 	}
 	if e.cfg.OnStoppedLeading != nil {
 		e.cfg.OnStoppedLeading()
@@ -180,8 +218,8 @@ func (e *Elector) observeLeader(id string) {
 }
 
 func (e *Elector) logf(format string, v ...interface{}) {
-	if l, ok := e.cfg.Logger.(Logger); ok && l != nil {
-		l.Printf("rediselection: "+format, v...)
+	if e.cfg.Logger != nil {
+		e.cfg.Logger.Printf("rediselection: "+format, v...)
 	}
 }
 

@@ -43,8 +43,9 @@ type Lock interface {
 	// Identity 返回持有者标识，同一进程内多个 Elector 应各不相同。
 	Identity() string
 	// TryAcquireOrRenew 原子地尝试获取或续约租约，返回事件码与租约快照。
-	// 事件码取值见 EventAcquired / EventRenewed / EventHeldByOther。
-	TryAcquireOrRenew(ctx context.Context, leaseDuration time.Duration) (int, LeaseRecord, error)
+	// 事件码类型为 Event；出错时返回 EventInvalid 与零值快照，
+	// 调用方应优先检查 error。
+	TryAcquireOrRenew(ctx context.Context, leaseDuration time.Duration) (Event, LeaseRecord, error)
 	// Release 在仍持有租约的前提下主动让位。
 	Release(ctx context.Context) error
 }
@@ -102,31 +103,38 @@ func DefaultIdentity() string {
 // TryAcquireOrRenew 执行一次原子的"尝试获取/续约"，对标 K8s
 // leaderelection 的 tryAcquireOrRenew。四分支判定见 script.go：
 //
-//	EventAcquired   新建租约或抢占过期租约成功，本实例成为持有者；
-//	EventRenewed    本实例本就是持有者，续约成功；
-//	EventHeldByOther 其他实例持锁且未过期，应继续等待。
+//	EventAcquired    新建租约或抢占过期租约成功，本实例成为持有者；
+//	EventRenewed     本实例本就是持有者，续约成功；
+//	EventHeldByOther 其他实例持锁且未过期，应继续等待；
+//	EventInvalid     存储错误或脚本返回异常，调用方应检查 error。
 //
-// 返回的 LeaseRecord 中 Holder 为执行后的当前持有者。
+// 返回完整的 LeaseRecord（Holder 为执行后的当前持有者，AcquireTime /
+// RenewTime 为 Redis 服务器时钟毫秒值——对齐 K8s：elector 每轮可见
+// 完整租约记录）；出错时返回零值快照。
 // 该方法幂等且无副作用竞争，可安全地由多个 goroutine 调用
 // （但通常只需 Elector 内部单 goroutine 周期调用）。
-func (l *LeaseLock) TryAcquireOrRenew(ctx context.Context, leaseDuration time.Duration) (int, LeaseRecord, error) {
+func (l *LeaseLock) TryAcquireOrRenew(ctx context.Context, leaseDuration time.Duration) (Event, LeaseRecord, error) {
 	res, err := l.acquire.Run(ctx, l.client, []string{l.key},
 		l.identity, leaseDuration.Milliseconds()).Result()
 	if err != nil {
-		return EventHeldByOther, LeaseRecord{}, err
+		return EventInvalid, LeaseRecord{}, err
 	}
 	arr, ok := res.([]interface{})
-	if !ok || len(arr) != 4 {
-		return EventHeldByOther, LeaseRecord{},
+	if !ok || len(arr) != 6 {
+		return EventInvalid, LeaseRecord{},
 			fmt.Errorf("rediselection: unexpected script reply: %v", res)
 	}
 	event, _ := arr[0].(int64)
 	version, _ := arr[1].(int64)
 	holder, _ := arr[2].(string)
 	transitions, _ := arr[3].(int64)
-	return int(event), LeaseRecord{
+	acquireTime, _ := arr[4].(int64)
+	renewTime, _ := arr[5].(int64)
+	return Event(event), LeaseRecord{
 		Holder:      holder,
 		Version:     version,
+		AcquireTime: acquireTime,
+		RenewTime:   renewTime,
 		Transitions: transitions,
 	}, nil
 }
@@ -160,11 +168,11 @@ func (l *LeaseLock) Get(ctx context.Context) (LeaseRecord, error) {
 	}
 	rec := LeaseRecord{
 		Holder:      m["holder"],
+		Version:     parseInt(m["version"]),
 		AcquireTime: parseInt(m["acquireTime"]),
 		RenewTime:   parseInt(m["renewTime"]),
+		Transitions: parseInt(m["transitions"]),
 	}
-	rec.Version = parseInt(m["version"])
-	rec.Transitions = parseInt(m["transitions"])
 	return rec, nil
 }
 

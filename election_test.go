@@ -48,8 +48,15 @@ func TestElector_Lifecycle(t *testing.T) {
 		<-ctx.Done()
 		close(startedCtxDone)
 	}
+	var stoppedCount atomic.Int32
 	stoppedCh := make(chan struct{}, 1)
-	stopped := func() { stoppedCh <- struct{}{} }
+	stopped := func() {
+		stoppedCount.Add(1)
+		select {
+		case stoppedCh <- struct{}{}:
+		default:
+		}
+	}
 
 	lock := NewLeaseLock(rdb, testKey, "A")
 	elector, err := NewElector(lock, fastOptions(true, started, stopped, nil)...)
@@ -86,6 +93,10 @@ func TestElector_Lifecycle(t *testing.T) {
 	}
 	if elector.IsLeader() {
 		t.Fatal("should not be leader after cancel")
+	}
+	// stepDown 已触发过一次，Run 退出（当过 leader）不重复触发
+	if n := stoppedCount.Load(); n != 1 {
+		t.Fatalf("OnStoppedLeading should fire exactly once, got %d", n)
 	}
 
 	// ReleaseOnCancel：renewTime 被置 0，加速 failover
@@ -312,6 +323,149 @@ func TestElector_LeaderOnlyWorkWithCtx(t *testing.T) {
 	}
 }
 
+// TestElector_StepDownOrder 验证 K8s 不变量：OnStoppedLeading 触发时，
+// OnStartedLeading 收到的业务 ctx 已被取消（cancel 前置于回调与 Release）。
+func TestElector_StepDownOrder(t *testing.T) {
+	rdb, _ := newTestRedis(t)
+
+	var bizCtx atomic.Pointer[context.Context]
+	started := func(ctx context.Context) { bizCtx.Store(&ctx) }
+	stoppedOk := make(chan bool, 1)
+	stopped := func() {
+		p := bizCtx.Load()
+		stoppedOk <- p != nil && (*p).Err() != nil
+	}
+
+	lock := NewLeaseLock(rdb, testKey, "A")
+	elector, err := NewElector(lock, fastOptions(true, started, stopped, nil)...)
+	if err != nil {
+		t.Fatalf("NewElector: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { elector.Run(ctx); close(runDone) }()
+
+	if !waitFor(t, 2*time.Second, "become leader", elector.IsLeader) {
+		t.Fatal("should become leader")
+	}
+	if !waitFor(t, 2*time.Second, "OnStartedLeading", func() bool { return bizCtx.Load() != nil }) {
+		t.Fatal("OnStartedLeading should fire")
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run should return after cancel")
+	}
+	select {
+	case ok := <-stoppedOk:
+		if !ok {
+			t.Fatal("OnStoppedLeading fired before business ctx was cancelled")
+		}
+	default:
+		t.Fatal("OnStoppedLeading should fire")
+	}
+}
+
+// TestElector_RunGuard 验证并发 Run 防护：后续调用立即返回且不触发回调；
+// Run 退出后可再次启动。
+func TestElector_RunGuard(t *testing.T) {
+	rdb, _ := newTestRedis(t)
+
+	var stoppedCount atomic.Int32
+	lock := NewLeaseLock(rdb, testKey, "A")
+	elector, err := NewElector(lock, fastOptions(false, nil, func() { stoppedCount.Add(1) }, nil)...)
+	if err != nil {
+		t.Fatalf("NewElector: %v", err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	done1 := make(chan struct{})
+	go func() { elector.Run(ctx1); close(done1) }()
+	if !waitFor(t, 2*time.Second, "first Run becomes leader", elector.IsLeader) {
+		t.Fatal("first Run should become leader")
+	}
+
+	// 并发第二次 Run：应立即返回
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done2 := make(chan struct{})
+	go func() { elector.Run(ctx2); close(done2) }()
+	select {
+	case <-done2:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("concurrent Run should return immediately")
+	}
+	if n := stoppedCount.Load(); n != 0 {
+		t.Fatalf("rejected Run must not fire OnStoppedLeading, got %d calls", n)
+	}
+
+	cancel1()
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Run should exit after cancel")
+	}
+	if n := stoppedCount.Load(); n != 1 {
+		t.Fatalf("OnStoppedLeading should fire exactly once, got %d", n)
+	}
+
+	// Run 退出后可重启
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	defer cancel3()
+	go elector.Run(ctx3)
+	if !waitFor(t, 2*time.Second, "Run restarts and leads again", elector.IsLeader) {
+		t.Fatal("Run should be restartable after exit")
+	}
+}
+
+// TestElector_OnStoppedLeadingNeverLed 验证 K8s 对齐语义：
+// 从未当选的实例在 Run 退出时也触发一次 OnStoppedLeading。
+func TestElector_OnStoppedLeadingNeverLed(t *testing.T) {
+	rdb, mr := newTestRedis(t)
+
+	// 预置他人持有的活跃租约（定住时钟使其永不过期），本实例无法当选
+	t0 := time.Unix(1700000000, 0)
+	mr.SetTime(t0)
+	rdb.HSet(context.Background(), testKey, map[string]interface{}{
+		"holder":      "B",
+		"version":     1,
+		"acquireTime": t0.UnixMilli(),
+		"renewTime":   t0.UnixMilli(),
+		"transitions": 0,
+	})
+
+	var stoppedCount atomic.Int32
+	lock := NewLeaseLock(rdb, testKey, "A")
+	elector, err := NewElector(lock, fastOptions(false, nil, func() { stoppedCount.Add(1) }, nil)...)
+	if err != nil {
+		t.Fatalf("NewElector: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { elector.Run(ctx); close(runDone) }()
+
+	// 等待至少一轮"谦让"尝试
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run should exit after cancel")
+	}
+	if n := stoppedCount.Load(); n != 1 {
+		t.Fatalf("OnStoppedLeading should fire once on exit without leading, got %d", n)
+	}
+	if elector.IsLeader() {
+		t.Fatal("must never become leader")
+	}
+}
+
 // TestNewElector_Validation 验证配置约束（与 K8s LeaderElectionConfig 校验对齐）。
 func TestNewElector_Validation(t *testing.T) {
 	rdb, _ := newTestRedis(t)
@@ -336,6 +490,13 @@ func TestNewElector_Validation(t *testing.T) {
 		}, false},
 		{"retry >= renew", []ElectorOption{
 			WithRenewDeadline(5 * time.Second), WithRetryPeriod(5 * time.Second),
+		}, false},
+		{"renew <= retry*jitter", []ElectorOption{
+			WithLeaseDuration(10 * time.Second),
+			WithRenewDeadline(2300 * time.Millisecond), WithRetryPeriod(2 * time.Second),
+		}, false},
+		{"jitter 0 keeps basic rule", []ElectorOption{
+			WithJitterFactor(0), WithRenewDeadline(2 * time.Second), WithRetryPeriod(3 * time.Second),
 		}, false},
 		{"negative jitter", []ElectorOption{WithJitterFactor(-0.1)}, false},
 	}

@@ -19,8 +19,8 @@
 - **降级等待重选**：丢锁后不退出进程，自动降级为候选者继续竞选
 - **零框架绑定**：不绑定日志库/指标库；直接依赖仅 [redis/go-redis/v9](https://github.com/redis/go-redis)
 - **两层 API**：高层 `Elector` 状态机开箱即用，低层 `LeaseLock` 原语可自由组合
-- **充分测试**：单测覆盖率 91%+（miniredis 驱动，含四分支、failover、
-  Redis 故障自贬、抢占后重选等场景）
+- **充分测试**：单测覆盖率 92%+（miniredis 驱动，含四分支、failover、
+  Redis 故障自贬、抢占后重选、回调顺序、并发防护等场景）
 
 ## 安装
 
@@ -85,7 +85,7 @@ leader 宕机后其余实例自动接管，failover 最坏约 `LeaseDuration + R
 | API Server 统一时间戳 | `redis.call('TIME')` Redis 服务器时钟 |
 | `tryAcquireOrRenew()` | 单 Lua 脚本四分支 |
 | `leaseTransitions` | `transitions` 字段 |
-| `ReleaseOnCancel` | 同名选项 |
+| `ReleaseOnCancel` | 同名选项（K8s 将 LeaseDurationSeconds 置 1，本库将 renewTime 置 0，效果同构：等待者下一轮即可抢占） |
 
 ### 租约数据结构
 
@@ -139,7 +139,7 @@ T1+15~17s B 抢占成功接管            ← failover 最坏 ≈ Lease+Retry
 |---|---|---|
 | `LeaseDuration` | 15s | 租约有效期，**failover 最坏等待的主要构成**；调小切换快但更易误判 |
 | `RenewDeadline` | 10s | 续约失败自贬宽限，**必须 < LeaseDuration**；保证"旧主先停、新主后上" |
-| `RetryPeriod` | 2s | 尝试间隔，**必须 < RenewDeadline**；实际间隔叠加 `[0, 1.2×)` 抖动 |
+| `RetryPeriod` | 2s | 尝试间隔，**必须满足 RetryPeriod×JitterFactor < RenewDeadline**（K8s 同款校验）；实际间隔叠加 `[0, 1.2×)` 抖动 |
 | `JitterFactor` | 1.2 | 抖动系数，防止多实例同频竞争 |
 | `ReleaseOnCancel` | false | 退出时主动让位；SIGTERM 场景建议开启 |
 
@@ -158,6 +158,14 @@ T1+15~17s B 抢占成功接管            ← failover 最坏 ≈ Lease+Retry
 
 注意：`OnNewLeader` 由库以独立 goroutine 异步触发，多次回调可能并发执行，
 回调内部如访问共享状态需自行加锁/使用原子操作。
+
+`OnStoppedLeading` 语义与 K8s 一致：每次失去 leadership 触发一次；若本次
+`Run` 从未当选，`Run` 退出时也会触发一次——不要假设它只在 `OnStartedLeading`
+之后调用。失去 leadership 时的收尾顺序为先取消业务 ctx、再（可选）让位、
+最后触发回调，保证回调触发时业务 ctx 已被取消。
+
+并发调用 `Run` 会被防护：后续调用记日志后直接返回、不触发任何回调；
+`Run` 返回后可再次调用。
 
 ### 低层 LeaseLock
 
@@ -186,6 +194,7 @@ rec, _ := lock.Get(ctx) // 只读快照，观测/排障
 | 场景 | 行为 |
 |---|---|
 | 实例时钟漂移 | 不影响：过期判定全部基于 Redis 服务器时钟 |
+| 实例本地时钟回拨（NTP） | RenewDeadline 宽限判定基于实例本地时钟，大幅回拨会推迟自贬（与 K8s 行为一致）；租约有效性判定不受影响 |
 | Redis 抖动/主从切换 | leader 在 `RenewDeadline` 宽限内重试，超时自贬；不会误让 |
 | Redis 完全不可用 | 所有实例自贬停跑 leader 任务；恢复后重新竞选 |
 | leader 假死复活（GC/网络分区） | 复活后 renew 发现 `holder != self` → 立即自贬；`Release` 校验 holder，不误伤新主 |
@@ -201,12 +210,16 @@ rec, _ := lock.Get(ctx) // 只读快照，观测/排障
 **Redis >= 5 的原因**：脚本含非确定性的 `TIME` 调用，Redis 5 起默认按
 effect replication 复制脚本，主从/哨兵场景安全。
 
-## 与 K8s 原生实现的两点刻意差异
+## 与 K8s 原生实现的三点刻意差异
 
 1. **丢锁后降级等待重选**，而非退出进程——适配网关/常驻服务等不允许自杀的场景；
 2. **被明确抢占时立即自贬**，而非等满 `RenewDeadline`——`HeldByOther` 说明
    存储系统健康、判定可信，立即退出可将被抢占场景的双跑窗口压缩到接近 0
-   （Redis 故障场景仍保留 `RenewDeadline` 宽限，防止抖动误判）。
+   （Redis 故障场景仍保留 `RenewDeadline` 宽限，防止抖动误判）；
+3. **失去 leadership 时先取消业务 ctx、再让位（Release）**——K8s 的 Release
+   是网络调用（预算 `RenewDeadline`），cancel 被压在其后会推迟业务停止；
+   前置 cancel 保住"`OnStoppedLeading` 触发时业务 ctx 已取消"这一 K8s
+   不变量，同时进一步压缩双跑窗口（failover 仅慢微秒级）。
 
 ## 测试
 
