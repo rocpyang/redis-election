@@ -98,7 +98,8 @@ func WithOnStoppedLeading(f func()) ElectorOption {
 }
 
 // WithOnNewLeader 注册"观察到新 leader"回调，包括自己首次当选。
-// 回调不应长时间阻塞（运行在独立 goroutine 中）。
+// 回调不应长时间阻塞（运行在独立 goroutine 中），
+// 且多次回调可能并发执行，回调内访问共享状态需自行同步。
 func WithOnNewLeader(f func(identity string)) ElectorOption {
 	return func(c *Config) { c.OnNewLeader = f }
 }

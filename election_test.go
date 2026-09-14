@@ -3,6 +3,7 @@ package rediselection
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,17 +105,19 @@ func TestElector_Failover(t *testing.T) {
 	rdb, _ := newTestRedis(t)
 
 	newLeaderB := make(chan string, 4)
-	var gotA, gotSelf bool
+	// OnNewLeader 回调由库异步（go）触发，与 waitFor 轮询构成跨 goroutine 读写，
+	// 必须用原子变量同步（CI 开启 -race 时普通 bool 会告警）。
+	var gotA, gotSelf atomic.Bool
 	onNewLeaderB := func(id string) {
 		select {
 		case newLeaderB <- id:
 		default:
 		}
 		if id == "A" {
-			gotA = true
+			gotA.Store(true)
 		}
 		if id == "B" {
-			gotSelf = true
+			gotSelf.Store(true)
 		}
 	}
 	stoppedA := make(chan struct{}, 1)
@@ -139,7 +142,7 @@ func TestElector_Failover(t *testing.T) {
 	}
 
 	go eB.Run(ctxB)
-	if !waitFor(t, 2*time.Second, "B observes leader A", func() bool { return gotA }) {
+	if !waitFor(t, 2*time.Second, "B observes leader A", func() bool { return gotA.Load() }) {
 		t.Fatal("B should observe A as leader")
 	}
 	if eB.IsLeader() {
@@ -156,7 +159,7 @@ func TestElector_Failover(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("A OnStoppedLeading should fire")
 	}
-	if !waitFor(t, 2*time.Second, "B observes self as leader", func() bool { return gotSelf }) {
+	if !waitFor(t, 2*time.Second, "B observes self as leader", func() bool { return gotSelf.Load() }) {
 		t.Fatal("B should observe itself as new leader")
 	}
 }

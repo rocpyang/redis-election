@@ -156,6 +156,9 @@ T1+15~17s B 抢占成功接管            ← failover 最坏 ≈ Lease+Retry
 
 见[快速开始](#快速开始)。`IsLeader()` / `LeaderID()` 可在任意 goroutine 查询。
 
+注意：`OnNewLeader` 由库以独立 goroutine 异步触发，多次回调可能并发执行，
+回调内部如访问共享状态需自行加锁/使用原子操作。
+
 ### 低层 LeaseLock
 
 需要自定义选主循环时使用：
